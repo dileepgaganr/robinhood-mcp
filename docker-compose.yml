@@ -1,0 +1,10 @@
+services:
+  robinhood:
+    build: .
+    container_name: robinhood
+    env_file:
+      - .env
+    # Keep container running and allow stdin interaction
+    stdin_open: true # -i
+    tty: false       # We want raw stdout/stdin for MCP, not a TTY
+    restart: unless-stopped

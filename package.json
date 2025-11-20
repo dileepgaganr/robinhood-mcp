@@ -1,0 +1,13 @@
+{
+  "name": "robinhood-mcp",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "type": "commonjs",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.22.0",
+    "dotenv": "^17.2.3"
+  },
+  "author": "Dileep gagan R",
+  "license": "MIT"
+}

@@ -1,0 +1,18 @@
+{
+  "args" : [
+    "exec",
+    "-i",
+    "robinhood",
+    "node",
+    "index.js"
+  ],
+  "command" : "docker",
+  "env" : {
+    "ROBINHOOD_USER" : "ROBINHOOD_USER",
+    "ROBINHOOD_PASSWORD" : "ROBINHOOD_PASSWORD",
+    "ROBINHOOD_ACCESS_TOKEN" : "ROBINHOOD_ACCESS_TOKEN",
+    "NODE_ENV" : "production",
+    "NODE_OPTIONS" : "--dns-result-order=ipv4first"
+  },
+  "useBuiltInNode" : true
+}

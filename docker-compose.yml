@@ -4,7 +4,12 @@ services:
     container_name: robinhood
     env_file:
       - .env
+    volumes:
+      - robinhood_tokens:/root/.tokens   # persist robin_stocks auth tokens across rebuilds
     # Keep container running and allow stdin interaction
     stdin_open: true # -i
     tty: false       # We want raw stdout/stdin for MCP, not a TTY
     restart: unless-stopped
+
+volumes:
+  robinhood_tokens:

@@ -9,3 +9,10 @@ npm-debug.log
 .docker-compose_local.yml
 local/*
 local/
+HAR/
+*.har
+scripts/js_bundles/
+scripts/probe_output.log
+scripts/legend.html
+__pycache__/
+*.pyc

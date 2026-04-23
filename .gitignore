@@ -7,3 +7,9 @@ dist/
 docker-compose_local.yml
 local/
 local/*
+HAR/
+*.har
+scripts/js_bundles/
+scripts/probe_output.log
+__pycache__/
+*.pyc

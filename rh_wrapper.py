@@ -5,7 +5,11 @@ import io
 import json
 import signal
 import time
+import uuid
+import re
+import datetime
 import pyotp
+import websocket
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -144,6 +148,277 @@ class _suppress_stdout:
             pass
 
 
+# ── Futures helpers (undocumented Robinhood Legend endpoints) ─────────
+# These wrap REST endpoints reverse-engineered from HAR capture of the
+# Legend web app. No official API exists — endpoints may change.
+_FUT_API = "https://api.robinhood.com"
+_FUT_HDRS = {"Origin": "https://robinhood.com", "Referer": "https://robinhood.com/"}
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+# Cache per-process — these don't change during a session.
+_fut_cache = {"rhs": None, "ceres_futures_id": None, "products": None}
+
+
+def _fut_get(path, params=None):
+    url = path if path.startswith("http") else f"{_FUT_API}{path}"
+    resp = r.helper.SESSION.get(url, params=params, headers=_FUT_HDRS, timeout=15)
+    if not resp.ok:
+        raise RuntimeError(f"GET {url} -> {resp.status_code}: {resp.text[:300]}")
+    try:
+        return resp.json()
+    except ValueError:
+        return resp.text
+
+
+def _fut_post(path, json_body):
+    url = path if path.startswith("http") else f"{_FUT_API}{path}"
+    hdrs = {**_FUT_HDRS, "Content-Type": "application/json"}
+    resp = r.helper.SESSION.post(url, json=json_body, headers=hdrs, timeout=15)
+    if not resp.ok:
+        raise RuntimeError(f"POST {url} -> {resp.status_code}: {resp.text[:500]}")
+    try:
+        return resp.json()
+    except ValueError:
+        return resp.text
+
+
+def _rhs_account_number():
+    if _fut_cache["rhs"]:
+        return _fut_cache["rhs"]
+    profile = r.profiles.load_account_profile()
+    rhs = profile.get("account_number")
+    if not rhs:
+        raise RuntimeError("Could not determine rhsAccountNumber from profile")
+    _fut_cache["rhs"] = rhs
+    return rhs
+
+
+def _ceres_futures_account_id():
+    if _fut_cache["ceres_futures_id"]:
+        return _fut_cache["ceres_futures_id"]
+    rhs = _rhs_account_number()
+    data = _fut_get("/ceres/v1/accounts", params={"rhsAccountNumber": rhs})
+    for acct in data.get("results", []):
+        if acct.get("accountType") == "FUTURES":
+            _fut_cache["ceres_futures_id"] = acct["id"]
+            return acct["id"]
+    raise RuntimeError("No FUTURES ceres account found — is futures trading enabled?")
+
+
+def _futures_products():
+    if _fut_cache["products"] is None:
+        data = _fut_get("/arsenal/v1/futures/products")
+        _fut_cache["products"] = data.get("results", [])
+    return _fut_cache["products"]
+
+
+def _resolve_contract_id(symbol_or_id):
+    """Accept a contract UUID, specific contract symbol (/MNQM26), or product
+    root (/MNQ → active front-month). Returns the futuresContractId UUID."""
+    s = (symbol_or_id or "").strip()
+    if _UUID_RE.match(s):
+        return s
+    if not s.startswith("/"):
+        s = "/" + s.upper()
+    else:
+        s = s.upper()
+    root_and_maybe_expiry = s.split(":")[0]  # strip :XCME suffix if any
+    m = re.match(r"^(/[A-Z0-9]+?)([FGHJKMNQUVXZ]\d{1,2})$", root_and_maybe_expiry)
+    product_symbol = m.group(1) if m else root_and_maybe_expiry
+    expiry_code = m.group(2) if m else None
+
+    product = next(
+        (p for p in _futures_products() if p.get("displaySymbol") == product_symbol),
+        None,
+    )
+    if not product:
+        raise RuntimeError(f"Futures product not found for symbol: {product_symbol}")
+
+    sched = _fut_get("/arsenal/v1/futures/atc_schedule",
+                     params={"productIds": product["id"]})
+    results = sched.get("results", []) or []
+
+    if expiry_code:
+        match = next((c for c in results
+                      if c.get("symbol", "").upper().endswith(expiry_code)), None)
+        if not match:
+            raise RuntimeError(f"Contract not found: {symbol_or_id}")
+        return match["futuresContractId"]
+
+    today = datetime.date.today().isoformat()
+    active = [c for c in results
+              if c.get("startDate", "") <= today <= c.get("endDate", "9999")]
+    if active:
+        return active[0]["futuresContractId"]
+    # Fall back to earliest upcoming.
+    upcoming = sorted([c for c in results if c.get("startDate", "") > today],
+                      key=lambda c: c["startDate"])
+    if upcoming:
+        return upcoming[0]["futuresContractId"]
+    raise RuntimeError(f"No active contract for {product_symbol}")
+
+
+def _require_futures_trading_allowed():
+    if os.getenv("ROBINHOOD_ALLOW_FUTURES_TRADING", "").strip() != "1":
+        raise RuntimeError(
+            "Futures order placement is gated. Set "
+            "ROBINHOOD_ALLOW_FUTURES_TRADING=1 in .env to enable."
+        )
+
+
+# ── DXLink streaming (reverse-engineered from Robinhood Legend) ────────
+# Robinhood Legend uses a Devexperts DXLink-compatible WebSocket at
+# api.robinhood.com/marketdata/streaming/legend/v2/. We fetch a short-lived
+# ticket from /marketdata/token/v1/ then open the WS and subscribe to
+# per-symbol Quote / Trade / Candle / Order (L2) events.
+
+def _get_streaming_token():
+    """Fetch a short-lived DXLink auth token + WSS URL. ~4h TTL."""
+    session_id = str(uuid.uuid4())
+    resp = r.helper.SESSION.get(
+        f"{_FUT_API}/marketdata/token/v1/",
+        params={"session_id": session_id, "session_type": "blackwidow"},
+        headers={**_FUT_HDRS, "X-Robinhood-Client-Platform": "black-widow"},
+        timeout=10,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"streaming token fetch failed: {resp.status_code} {resp.text[:200]}")
+    body = resp.json()
+    data = body.get("data", {}).get("data", {})
+    if not data.get("token"):
+        raise RuntimeError(f"streaming token response malformed: {body}")
+    return data["token"], data.get("wss_url", "wss://api.robinhood.com/marketdata/streaming/legend/v2/")
+
+
+def _dxlink_subscribe(subscriptions, fields_by_type, collect_seconds=2.5, max_events=None):
+    """Open the DXLink WS, subscribe, collect events for a short window, return them.
+
+    `subscriptions` is a list of dicts like [{"type":"Quote","symbol":"/ESM26:XCME"}, ...]
+    `fields_by_type` is the FEED_SETUP eventFields map for each requested type.
+    Returns a list of data-entry dicts (concatenation of all FEED_DATA `data` arrays).
+    """
+    oauth = r.helper.SESSION.headers.get("Authorization", "")
+    if oauth.startswith("Bearer "):
+        oauth = oauth[7:]
+    if not oauth:
+        raise RuntimeError("No OAuth token on session (run login first)")
+
+    dx_token, wss_url = _get_streaming_token()
+    ws = websocket.create_connection(
+        wss_url,
+        header=["Origin: https://robinhood.com"],
+        subprotocols=["bearer", oauth],
+        timeout=10,
+    )
+    try:
+        # SETUP + AUTH + MD_SETUP
+        ws.send(json.dumps({
+            "type": "SETUP", "channel": 0,
+            "keepaliveTimeout": 60, "acceptKeepaliveTimeout": 60,
+            "version": "0.1-DXF-JS/0.5.1",
+        }))
+        ws.send(json.dumps({"type": "AUTH", "channel": 0, "token": dx_token}))
+        ws.send(json.dumps({
+            "type": "MD_SETUP",
+            "enable_heartbeat_timestamp": True,
+            "enable_logging_raw_incoming_message": False,
+            "enable_subscription_debugging": False,
+        }))
+
+        # Wait for AUTHORIZED (first AUTH_STATE is often UNAUTHORIZED, then flips).
+        ws.settimeout(5.0)
+        authorized = False
+        deadline = time.time() + 5.0
+        while not authorized and time.time() < deadline:
+            msg = json.loads(ws.recv())
+            if msg.get("type") == "AUTH_STATE" and msg.get("state") == "AUTHORIZED":
+                authorized = True
+            elif msg.get("type") == "AUTH_STATE" and msg.get("state") == "UNAUTHORIZED" and msg.get("channel") == 0:
+                continue  # initial state
+        if not authorized:
+            raise RuntimeError("DXLink auth did not flip to AUTHORIZED within 5s")
+
+        # Open FEED channel
+        channel = 3
+        ws.send(json.dumps({
+            "type": "CHANNEL_REQUEST", "channel": channel,
+            "service": "FEED", "parameters": {"contract": "AUTO"},
+        }))
+        opened = False
+        while not opened and time.time() < deadline + 3:
+            msg = json.loads(ws.recv())
+            if msg.get("type") == "CHANNEL_OPENED" and msg.get("channel") == channel:
+                opened = True
+        if not opened:
+            raise RuntimeError("CHANNEL_OPENED not received within 3s")
+
+        # Tell server what fields we want
+        ws.send(json.dumps({
+            "type": "FEED_SETUP", "channel": channel,
+            "acceptAggregationPeriod": 0.25,
+            "acceptDataFormat": "FULL",
+            "acceptEventFields": fields_by_type,
+        }))
+
+        # Subscribe
+        ws.send(json.dumps({
+            "type": "FEED_SUBSCRIPTION", "channel": channel,
+            "reset": True, "add": subscriptions,
+        }))
+
+        # Collect FEED_DATA for a short window
+        events = []
+        ws.settimeout(0.5)
+        collection_deadline = time.time() + collect_seconds
+        while time.time() < collection_deadline:
+            try:
+                raw = ws.recv()
+            except Exception:
+                continue
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            if msg.get("type") == "FEED_DATA":
+                data = msg.get("data") or []
+                events.extend(data if isinstance(data, list) else [data])
+                if max_events and len(events) >= max_events:
+                    break
+        return events
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def _product_source(product_symbol):
+    """Map a product root to the DXLink `source` string for Order (L2) subs.
+    Almost all Robinhood futures live on CME Globex. Minor tweak point later
+    if/when an exchange outside Globex is added."""
+    return "GLBX"
+
+
+def _resolve_dx_symbol(symbol_or_id):
+    """Turn a user input into the DX symbol string with exchange suffix.
+
+    Inputs accepted:
+      - Full DX symbol: `/ESM26:XCME` (passthrough)
+      - Contract symbol: `/ESM26` → adds `:XCME`
+      - Contract UUID → resolved to symbol via /arsenal/v1/futures/contracts/{id}
+      - Product root `/ES` → resolves to active front-month symbol
+    """
+    s = (symbol_or_id or "").strip()
+    if ":" in s:
+        return s
+    if _UUID_RE.match(s):
+        detail = _fut_get(f"/arsenal/v1/futures/contracts/{s}")
+        return detail["symbol"]  # already in "/ESM26:XCME" form
+    cid = _resolve_contract_id(s)  # root → front-month, or specific contract
+    detail = _fut_get(f"/arsenal/v1/futures/contracts/{cid}")
+    return detail["symbol"]
+
+
 def handle_command(data):
     command = data.get("command")
     args = data.get("args", [])
@@ -272,6 +547,255 @@ def handle_command(data):
         if data and isinstance(data, list) and len(data) > 0:
             return data[0]
         return data
+    # ── Futures (reverse-engineered from Robinhood Legend) ─────────────
+    elif command == "futures_products":
+        return {"results": _futures_products()}
+    elif command == "futures_product":
+        # args: [productId | product symbol like /MNQ]
+        pid = args[0]
+        if not _UUID_RE.match(pid):
+            sym = pid if pid.startswith("/") else "/" + pid.upper()
+            prod = next((p for p in _futures_products() if p.get("displaySymbol") == sym.upper()), None)
+            if not prod:
+                raise RuntimeError(f"Futures product not found: {args[0]}")
+            pid = prod["id"]
+        return _fut_get(f"/arsenal/v1/futures/products/{pid}")
+    elif command == "futures_contract":
+        # args: [contractId | symbol like /MNQM26 or /MNQ for front-month]
+        cid = _resolve_contract_id(args[0])
+        return _fut_get(f"/arsenal/v1/futures/contracts/{cid}")
+    elif command == "futures_expirations":
+        # args: [productId | product symbol]
+        raw = args[0]
+        if _UUID_RE.match(raw):
+            pid = raw
+        else:
+            sym = raw if raw.startswith("/") else "/" + raw.upper()
+            prod = next((p for p in _futures_products() if p.get("displaySymbol") == sym.upper()), None)
+            if not prod:
+                raise RuntimeError(f"Futures product not found: {raw}")
+            pid = prod["id"]
+        return _fut_get("/arsenal/v1/futures/atc_schedule", params={"productIds": pid})
+    elif command == "futures_margin_requirement":
+        # args: [contractId | symbol, margin_type(OVERNIGHT|DAY, default OVERNIGHT)]
+        cid = _resolve_contract_id(args[0])
+        margin_type = args[1].upper() if len(args) > 1 else "OVERNIGHT"
+        if not margin_type.startswith("MARGIN_TYPE_"):
+            margin_type = f"MARGIN_TYPE_{margin_type}"
+        return _fut_get("/arsenal/v1/futures/margin_requirement", params={
+            "contractId": cid,
+            "marginType": margin_type,
+            "accountType": "ACCOUNT_TYPE_MARGIN_NO_LIMIT",
+        })
+    elif command == "futures_eligibility":
+        return _fut_get(f"/ceres/v1/futures_account_eligibility/{_rhs_account_number()}")
+    elif command == "futures_buying_power":
+        return _fut_get(f"/futures/{_rhs_account_number()}/futures_buying_power/")
+    elif command == "buying_power_breakdown":
+        return _fut_get(f"/accounts/{_rhs_account_number()}/buying_power_breakdown")
+    elif command == "futures_positions":
+        return _fut_get(f"/ceres/v1/accounts/{_ceres_futures_account_id()}/aggregated_positions")
+    elif command == "futures_contract_quantity":
+        # args: [contractId | symbol] — accepts multiple comma-separated too
+        raw = args[0]
+        cids = []
+        for piece in raw.split(","):
+            cids.append(_resolve_contract_id(piece.strip()))
+        return _fut_get(
+            f"/ceres/v1/accounts/{_ceres_futures_account_id()}/contract_quantities",
+            params={"contractIds": ",".join(cids)},
+        )
+    elif command == "futures_pnl":
+        return _fut_get(f"/ceres/v1/accounts/{_ceres_futures_account_id()}/pnl_cost_basis")
+    elif command == "futures_orders":
+        return _fut_get("/wormhole/bw/orders/recent",
+                        params={"accountNumber": _rhs_account_number()})
+    elif command == "futures_order":
+        # args: [orderId]
+        oid = args[0]
+        return _fut_get(f"/wormhole/bw/orders/{oid}", params={
+            "assetType": "FUTURES",
+            "rhsAccountNumber": _rhs_account_number(),
+        })
+    elif command == "futures_preview_order":
+        # args: [contractId | symbol, side, quantity]
+        cid = _resolve_contract_id(args[0])
+        side = args[1].upper()
+        if side not in ("BUY", "SELL"):
+            raise RuntimeError("side must be BUY or SELL")
+        qty = str(args[2])
+        return _fut_post("/ceres/v1/accounts/buying_power_effect", {
+            "accountId": _ceres_futures_account_id(),
+            "tentativeFuturesOrder": {
+                "legs": [{
+                    "contractType": "OUTRIGHT",
+                    "contractId": cid,
+                    "ratioQuantity": 1,
+                    "orderSide": side,
+                }],
+                "quantity": qty,
+            },
+        })
+    elif command == "futures_place_order":
+        # args: [contractId | symbol, side, quantity, order_type, limit_price, time_in_force]
+        _require_futures_trading_allowed()
+        cid = _resolve_contract_id(args[0])
+        side = args[1].upper()
+        if side not in ("BUY", "SELL"):
+            raise RuntimeError("side must be BUY or SELL")
+        qty = str(args[2])
+        order_type = args[3].upper() if len(args) > 3 else "LIMIT"
+        if order_type not in ("LIMIT", "MARKET"):
+            raise RuntimeError("order_type must be LIMIT or MARKET")
+        limit_price = str(args[4]) if len(args) > 4 and args[4] not in (None, "", "null") else None
+        if order_type == "LIMIT" and not limit_price:
+            raise RuntimeError("limit_price required for LIMIT orders")
+        tif = args[5].upper() if len(args) > 5 else "GFD"
+        if tif not in ("GFD", "GTC"):
+            raise RuntimeError("time_in_force must be GFD or GTC")
+        body = {
+            "accountId": _ceres_futures_account_id(),
+            "legs": [{
+                "contractType": "OUTRIGHT",
+                "contractId": cid,
+                "ratioQuantity": 1,
+                "orderSide": side,
+            }],
+            "quantity": qty,
+            "orderType": order_type,
+            "orderTrigger": "IMMEDIATE",
+            "timeInForce": tif,
+            "refId": str(uuid.uuid4()),
+        }
+        if order_type == "LIMIT":
+            body["limitPrice"] = limit_price
+        sys.stderr.write(
+            f"📈 FUTURES ORDER: {side} {qty} {args[0]} "
+            f"{order_type}{'@'+limit_price if limit_price else ''} {tif}\n"
+        )
+        sys.stderr.flush()
+        return _fut_post("/ceres/v1/orders", body)
+    elif command == "futures_cancel_order":
+        # args: [orderId]
+        order_id = args[0]
+        sys.stderr.write(f"❌ FUTURES CANCEL: {order_id}\n")
+        sys.stderr.flush()
+        return _fut_post(f"/ceres/v1/orders/{order_id}/cancel", {
+            "accountId": _ceres_futures_account_id(),
+        })
+    # ── DXLink streaming (L1 quote / Trade / Candle / L2 Order book) ──
+    elif command == "futures_quote":
+        # args: [symbol]
+        dx_symbol = _resolve_dx_symbol(args[0])
+        events = _dxlink_subscribe(
+            [{"type": "Quote", "symbol": dx_symbol}],
+            {"Quote": ["eventSymbol", "bidPrice", "askPrice", "bidSize", "askSize", "bidTime", "askTime"]},
+            collect_seconds=2.0,
+            max_events=10,
+        )
+        if not events:
+            return {"symbol": dx_symbol, "quote": None, "note": "no quote events within 2s (market closed or symbol inactive?)"}
+        # Return the most recent event
+        return {"symbol": dx_symbol, "quote": events[-1], "events_seen": len(events)}
+    elif command == "futures_trade":
+        # args: [symbol]
+        dx_symbol = _resolve_dx_symbol(args[0])
+        events = _dxlink_subscribe(
+            [{"type": "Trade", "symbol": dx_symbol}],
+            {"Trade": ["eventSymbol", "price", "size", "time", "dayVolume"]},
+            collect_seconds=2.0,
+            max_events=5,
+        )
+        if not events:
+            return {"symbol": dx_symbol, "trade": None, "note": "no trade events within 2s"}
+        return {"symbol": dx_symbol, "trade": events[-1], "events_seen": len(events)}
+    elif command == "futures_historicals":
+        # args: [symbol, interval, span]
+        # interval: '1m','5m','15m','1h','4h','1d' (DX format suffix) default '1h'
+        # span: time window in seconds back from now (default 7 days)
+        raw_symbol = args[0]
+        interval = args[1] if len(args) > 1 else "1h"
+        span_sec = int(args[2]) if len(args) > 2 and args[2] not in (None, "") else 7 * 24 * 3600
+        dx_symbol = _resolve_dx_symbol(raw_symbol)
+        # For candles we use the product-level symbol (e.g. /ES:XCME) with
+        # interval notation: /ES:XCME{=1h,tho=false,a=m}
+        # Extract the product root from contract symbol: "/ESM26:XCME" -> "/ES:XCME"
+        m = re.match(r"^(/[A-Z0-9]+?)[FGHJKMNQUVXZ]\d{1,2}(:.*)$", dx_symbol)
+        product_symbol = f"{m.group(1)}{m.group(2)}" if m else dx_symbol
+        candle_symbol = f"{product_symbol}{{={interval},tho=false,a=m}}"
+        from_time_ms = int((time.time() - span_sec) * 1000)
+        events = _dxlink_subscribe(
+            [{"type": "Candle", "symbol": candle_symbol,
+              "fromTime": from_time_ms, "instrumentType": "futures_product"}],
+            {"Candle": ["eventSymbol", "eventTime", "open", "high", "low", "close", "volume", "time"]},
+            collect_seconds=3.0,
+        )
+        # Dedupe by `time` (keep last value per bar), sort ascending by time,
+        # drop placeholder bars where all OHLC values are NaN.
+        import math
+        def _is_nan(v):
+            return v in (None, "NaN") or (isinstance(v, float) and math.isnan(v))
+        by_time = {}
+        for e in events:
+            if "time" in e and not all(_is_nan(e.get(k)) for k in ("open", "high", "low", "close")):
+                by_time[e["time"]] = e
+        bars = sorted(by_time.values(), key=lambda e: e.get("time", 0))
+        return {
+            "symbol": dx_symbol,
+            "product_symbol": product_symbol,
+            "interval": interval,
+            "from_time_ms": from_time_ms,
+            "bars": bars,
+            "bar_count": len(bars),
+        }
+    elif command == "futures_l2_snapshot":
+        # args: [symbol, levels(default 10)]
+        dx_symbol = _resolve_dx_symbol(args[0])
+        levels = int(args[1]) if len(args) > 1 and args[1] not in (None, "") else 10
+        events = _dxlink_subscribe(
+            [{"type": "Order", "symbol": dx_symbol, "source": "GLBX"}],
+            {"Order": ["eventFlags", "eventSymbol", "eventType", "index", "side", "sequence", "price", "size", "time"]},
+            collect_seconds=3.0,
+        )
+        # Order events arrive as a mix of snapshot + deltas. Each entry has
+        # an `index` (order ID), `side`, `price`, `size`. Apply in order:
+        #   eventFlags & 0x10 (REMOVE_EVENT): delete the order
+        #   size missing / "NaN" / <= 0: delete the order
+        #   else: insert/update the order at price
+        import math
+        book = {"BUY": {}, "SELL": {}}
+        for e in events:
+            side = e.get("side")
+            idx = e.get("index")
+            if side not in book or idx is None:
+                continue
+            flags = e.get("eventFlags", 0) or 0
+            size = e.get("size")
+            price = e.get("price")
+            is_nan_size = (size in (None, "NaN")) or (isinstance(size, float) and math.isnan(size))
+            if (flags & 0x10) or is_nan_size or (isinstance(size, (int, float)) and size <= 0):
+                book[side].pop(idx, None)
+            elif isinstance(price, (int, float)) and not (isinstance(price, float) and math.isnan(price)):
+                book[side][idx] = {"price": price, "size": size}
+        # Aggregate by price level
+        def aggregate(side_book, reverse):
+            by_price = {}
+            for entry in side_book.values():
+                p = entry["price"]
+                by_price[p] = by_price.get(p, 0) + (entry["size"] or 0)
+            return sorted(
+                [{"price": p, "size": round(s, 4)} for p, s in by_price.items()],
+                key=lambda x: x["price"], reverse=reverse,
+            )[:levels]
+        bids = aggregate(book["BUY"], reverse=True)
+        asks = aggregate(book["SELL"], reverse=False)
+        return {
+            "symbol": dx_symbol,
+            "levels": levels,
+            "bids": bids,
+            "asks": asks,
+            "events_processed": len(events),
+        }
     else:
         raise ValueError(f"Unknown command: {command}")
 

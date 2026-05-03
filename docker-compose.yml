@@ -10,6 +10,10 @@ services:
     stdin_open: true # -i
     tty: false       # We want raw stdout/stdin for MCP, not a TTY
     restart: unless-stopped
+    init: true       # PID 1 is a tiny reaper — cleans up orphaned node/python
+                     # children left behind when `docker exec -i ... node index.js`
+                     # wrappers die without signal propagation. Prevents the
+                     # zombie-accumulation → OOM → "initialize timeout" loop.
 
 volumes:
   robinhood_tokens:

@@ -56,14 +56,51 @@ for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         pass
 
 
-def login():
+def login(force_credentials=False):
+    """Authenticate with Robinhood.
+
+    On startup we honour `ROBINHOOD_ACCESS_TOKEN` from env when set — this
+    skips the device-approval push and is fast.
+
+    On a 401 / JWT-expired recovery path the caller passes
+    `force_credentials=True`. We then bypass the env token (which we now
+    know is invalid) and run the full user/password flow. If
+    `ROBINHOOD_MFA_SECRET` is set we generate a TOTP automatically;
+    otherwise robin_stocks triggers Robinhood's device-approval push
+    notification to the user's mobile app — the user taps "approve" and a
+    fresh token is issued + persisted to /root/.tokens/robinhood.pickle.
+    """
     access_token = os.getenv("ROBINHOOD_ACCESS_TOKEN")
-    if access_token and access_token.strip():
+    if not force_credentials and access_token and access_token.strip():
         if not access_token.startswith("Bearer "):
             access_token = "Bearer " + access_token
         r.helper.SESSION.headers["Authorization"] = access_token
         r.helper.set_login_state(True)
-        return True, "Logged in with Access Token"
+        # Validate the token now — if it's dead, fall through to user/pass
+        # below instead of silently returning "success" and forcing the next
+        # API call to trigger 401 recovery. Saves one wasted request per
+        # startup and surfaces the failure mode early.
+        try:
+            v = r.helper.SESSION.get(
+                "https://api.robinhood.com/user/", timeout=8,
+                headers={"Origin": "https://robinhood.com"},
+            )
+            if v.status_code == 401:
+                sys.stderr.write(
+                    "⚠️  ROBINHOOD_ACCESS_TOKEN is expired/invalid (401). "
+                    "Falling back to user/password login.\n"
+                )
+                sys.stderr.flush()
+                r.helper.SESSION.headers.pop("Authorization", None)
+                r.helper.set_login_state(False)
+                # fall through to credentials flow below
+            else:
+                return True, "Logged in with Access Token"
+        except Exception as e:
+            # Network blip — assume token is OK and proceed.
+            sys.stderr.write(f"  (token validation skipped: {e})\n")
+            sys.stderr.flush()
+            return True, "Logged in with Access Token (unvalidated)"
 
     user = os.getenv("ROBINHOOD_USER")
     password = os.getenv("ROBINHOOD_PASSWORD")
@@ -71,6 +108,21 @@ def login():
 
     if not user or not password:
         return False, "Missing credentials"
+
+    if force_credentials:
+        # Wipe the dead Authorization header so robin_stocks doesn't reuse
+        # the expired Bearer when its login() fires off internal API calls.
+        try:
+            r.helper.SESSION.headers.pop("Authorization", None)
+            r.helper.set_login_state(False)
+        except Exception:
+            pass
+        sys.stderr.write(
+            "🔔 Triggering fresh user/password login — if MFA_SECRET is "
+            "unset, Robinhood will push a device-approval notification "
+            "to the mobile app. Approve it to complete login.\n"
+        )
+        sys.stderr.flush()
 
     try:
         # Suppress robin_stocks login prints — they corrupt JSON-RPC stdout
@@ -89,18 +141,27 @@ def login():
         return False, str(e)
 
 
-def maybe_login(reason="manual"):
+def maybe_login(reason="manual", force_credentials=False):
     """Rate-limited wrapper around login().
 
     If we attempted a login recently we memoize the prior result instead of
     hitting the network again. Returns (ok, msg, was_cached).
+
+    `force_credentials=True` (used by 401-recovery path) bypasses the env
+    `ROBINHOOD_ACCESS_TOKEN` and runs the full user/password flow, which
+    triggers Robinhood's device-approval push to the mobile app.
     """
     global _last_login_ts, _last_login_success, _last_login_msg
 
     now = time.time()
     elapsed = now - _last_login_ts
 
-    if _last_login_ts > 0:
+    # Cooldown applies to BEST-EFFORT logins. When the caller explicitly
+    # asks for force_credentials (i.e., the previous "success" was env-token
+    # which we now know is invalid because the API just returned 401), we
+    # bypass the cache and force a fresh credential login. Otherwise we'd
+    # echo the stale cached success and the bot would hit the same 401.
+    if _last_login_ts > 0 and not force_credentials:
         # Longer cooldown after a failed attempt — no point hammering auth.
         cooldown = _LOGIN_COOLDOWN_SEC if _last_login_success else _LOGIN_FAIL_COOLDOWN_SEC
         if elapsed < cooldown:
@@ -111,10 +172,13 @@ def maybe_login(reason="manual"):
             sys.stderr.flush()
             return _last_login_success, _last_login_msg, True
 
-    sys.stderr.write(f"🔑 Login attempt (reason={reason}) at t={now:.1f}\n")
+    sys.stderr.write(
+        f"🔑 Login attempt (reason={reason}, force_credentials={force_credentials}) "
+        f"at t={now:.1f}\n"
+    )
     sys.stderr.flush()
 
-    ok, msg = login()
+    ok, msg = login(force_credentials=force_credentials)
 
     _last_login_ts = time.time()
     _last_login_success = ok
@@ -833,11 +897,17 @@ def main():
             except Exception as e:
                 error_str = str(e)
 
-            # Auto re-login on 401 Unauthorized and retry once — but only if the
-            # rate-limited wrapper actually performed a fresh login. If maybe_login
-            # returns a cached result, retrying would produce the same 401.
-            if "401" in error_str and "Unauthorized" in error_str:
-                ok, msg, cached = maybe_login(reason="401-recovery")
+            # Auto re-login on any 401 (Unauthorized, JWT verification failed,
+            # token expired, etc.) and retry once. Force a fresh user/password
+            # login so the env-supplied ROBINHOOD_ACCESS_TOKEN — which we now
+            # know is invalid — is bypassed. This triggers Robinhood's device-
+            # approval push to the mobile app (or auto-completes if MFA secret
+            # is set). If maybe_login returns a cached result, retrying would
+            # hit the same 401, so fail fast instead.
+            if "401" in error_str:
+                ok, msg, cached = maybe_login(
+                    reason="401-recovery", force_credentials=True
+                )
                 if ok and not cached:
                     try:
                         response_data = handle_command(request)
@@ -846,9 +916,6 @@ def main():
                     except Exception as retry_err:
                         error_str = str(retry_err)
                 elif cached:
-                    # Either we just retried and it's still 401, or a recent login
-                    # already failed. Fail fast so Node / Claude can surface the error
-                    # instead of silently stalling while the cooldown expires.
                     error_str = (
                         f"Upstream 401 — last login attempt was cached "
                         f"({msg!r}); skipping duplicate re-login"

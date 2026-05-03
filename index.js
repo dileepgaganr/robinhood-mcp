@@ -9,13 +9,17 @@ const path = require('path');
 
 const server = new McpServer({
     name: 'robinhood-mcp',
-    version: '1.3.0',
+    version: '1.3.1',
 });
 
 const PYTHON_SCRIPT = path.join(__dirname, 'rh_wrapper.py');
 
 // ── Resource limits ──────────────────────────────────────────────────
-const REQUEST_TIMEOUT_MS = 30_000;
+// Bumped from 30s → 120s so the device-approval flow (Robinhood pushes a
+// notification to the mobile app on user/password login) has time for
+// the user to tap "Approve". Without this the login subprocess gets
+// killed mid-handshake. Set MFA_SECRET in .env for ~3s unattended login.
+const REQUEST_TIMEOUT_MS = 120_000;
 const MAX_PENDING = 200;
 const MAX_BUFFER_BYTES = 16 * 1024 * 1024; // 16 MB
 
@@ -552,6 +556,18 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGHUP', () => shutdown('SIGHUP'));
 
+// Critical: when this process is launched via `docker exec -i`, the parent
+// (the MCP client) disconnecting does NOT send a signal — it just closes
+// stdin. Without this handler the node process becomes a zombie inside the
+// container, accumulating one per reconnection until OOM. (See git log for
+// context on the v1.3.1 → v1.3.1 leak fix.)
+process.stdin.on('end', () => shutdown('stdin-end'));
+process.stdin.on('close', () => shutdown('stdin-close'));
+process.stdin.on('error', (err) => {
+    console.error('stdin error:', err && err.message);
+    shutdown('stdin-error');
+});
+
 process.on('uncaughtException', (err) => {
     console.error('Uncaught exception:', err);
     shutdown('uncaughtException');
@@ -563,7 +579,7 @@ process.on('unhandledRejection', (reason) => {
 async function main() {
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error('Robinhood MCP Server v1.3.0 running on stdio');
+    console.error('Robinhood MCP Server v1.3.1 running on stdio');
 }
 
 main().catch((error) => {

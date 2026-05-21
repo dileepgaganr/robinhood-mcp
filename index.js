@@ -9,7 +9,7 @@ const path = require('path');
 
 const server = new McpServer({
     name: 'robinhood-mcp',
-    version: '1.3.1',
+    version: '1.3.2',
 });
 
 const PYTHON_SCRIPT = path.join(__dirname, 'rh_wrapper.py');
@@ -22,6 +22,31 @@ const PYTHON_SCRIPT = path.join(__dirname, 'rh_wrapper.py');
 const REQUEST_TIMEOUT_MS = 120_000;
 const MAX_PENDING = 200;
 const MAX_BUFFER_BYTES = 16 * 1024 * 1024; // 16 MB
+
+// ── Idle watchdog ────────────────────────────────────────────────────
+// When this server is launched via `docker exec -i ... node index.js` and
+// the MCP client dies ABRUPTLY (Claude Desktop quit/crash/network drop),
+// Docker does not reliably deliver a stdin EOF — the fd stays open but
+// silent, leaving a wedged orphan that never exits. Over days these pile
+// up and each can independently re-auth on 401, hammering Robinhood.
+// The stdin 'end'/'close' handlers below catch CLEAN disconnects; this
+// idle timer catches the abrupt ones: if no stdin activity arrives within
+// the window, we self-terminate. Reset on every byte from the client.
+// Tune via MCP_IDLE_TIMEOUT_MS (default 30 min). Set 0 to disable.
+const IDLE_TIMEOUT_MS = (() => {
+    const v = parseInt(process.env.MCP_IDLE_TIMEOUT_MS || '', 10);
+    return Number.isFinite(v) ? v : 30 * 60 * 1000;
+})();
+let idleTimer = null;
+function resetIdleTimer() {
+    if (IDLE_TIMEOUT_MS <= 0) return;
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+        console.error(`No client activity for ${IDLE_TIMEOUT_MS / 1000}s — assuming abandoned connection, shutting down.`);
+        shutdown('idle-timeout');
+    }, IDLE_TIMEOUT_MS);
+    if (typeof idleTimer.unref === 'function') idleTimer.unref();
+}
 
 // ── Subprocess + pending-request state ───────────────────────────────
 let pythonProcess = null;
@@ -560,13 +585,17 @@ process.on('SIGHUP', () => shutdown('SIGHUP'));
 // (the MCP client) disconnecting does NOT send a signal — it just closes
 // stdin. Without this handler the node process becomes a zombie inside the
 // container, accumulating one per reconnection until OOM. (See git log for
-// context on the v1.3.1 → v1.3.1 leak fix.)
+// context on the v1.3.0 → v1.3.1 → v1.3.2 leak fixes.)
 process.stdin.on('end', () => shutdown('stdin-end'));
 process.stdin.on('close', () => shutdown('stdin-close'));
 process.stdin.on('error', (err) => {
     console.error('stdin error:', err && err.message);
     shutdown('stdin-error');
 });
+// Observe (not consume) client bytes to keep the idle watchdog alive. The
+// MCP SDK transport reads stdin too; multiple 'data' listeners each receive
+// the same chunks, so this does not steal input from the transport.
+process.stdin.on('data', () => resetIdleTimer());
 
 process.on('uncaughtException', (err) => {
     console.error('Uncaught exception:', err);
@@ -579,7 +608,9 @@ process.on('unhandledRejection', (reason) => {
 async function main() {
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error('Robinhood MCP Server v1.3.1 running on stdio');
+    resetIdleTimer(); // arm the abandoned-connection watchdog
+    const idleMin = IDLE_TIMEOUT_MS > 0 ? `${Math.round(IDLE_TIMEOUT_MS / 60000)}min idle-timeout` : 'idle-timeout disabled';
+    console.error(`Robinhood MCP Server v1.3.2 running on stdio (${idleMin})`);
 }
 
 main().catch((error) => {

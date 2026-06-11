@@ -125,17 +125,42 @@ def login(force_credentials=False):
         sys.stderr.flush()
 
     try:
-        # Suppress robin_stocks login prints — they corrupt JSON-RPC stdout
+        # robin_stocks's login() prints status/errors to stdout which would
+        # corrupt our JSON-RPC stream. Capture it instead and surface to
+        # stderr only on actual failure for diagnosis.
         old_stdout = sys.stdout
-        sys.stdout = io.StringIO()
+        captured = io.StringIO()
+        sys.stdout = captured
         try:
             if mfa_secret and mfa_secret.strip():
                 totp = pyotp.TOTP(mfa_secret).now()
-                r.login(user, password, mfa_code=totp)
+                login_result = r.login(user, password, mfa_code=totp)
             else:
-                r.login(user, password)
+                login_result = r.login(user, password)
         finally:
             sys.stdout = old_stdout
+        captured_text = captured.getvalue()
+
+        # Detect silent failure. robin_stocks 3.4.0's r.login() does NOT
+        # always raise on failure — e.g., a 429 from the device-approval
+        # push endpoint just prints "Login failed. Check credentials..."
+        # and returns None. So check the actual session state, not just
+        # whether an exception fired.
+        #   1. r.login should have set an Authorization Bearer header
+        #   2. r.login returns a dict with "access_token" on success, None on fail
+        auth_header = r.helper.SESSION.headers.get("Authorization", "")
+        login_ok = (
+            login_result is not None
+            and isinstance(login_result, dict)
+            and bool(login_result.get("access_token"))
+            and auth_header.startswith("Bearer ")
+        )
+        if not login_ok:
+            # Echo robin_stocks' diagnostic text to stderr so the user can
+            # see what actually happened (429, MFA timeout, bad creds, etc.).
+            tail = captured_text.strip().split("\n")[-5:]
+            diag = " | ".join(line.strip() for line in tail if line.strip())
+            return False, f"r.login silent failure: {diag}" if diag else "r.login silent failure (no diagnostic)"
         return True, "Logged in"
     except Exception as e:
         return False, str(e)

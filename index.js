@@ -9,7 +9,7 @@ const path = require('path');
 
 const server = new McpServer({
     name: 'robinhood-mcp',
-    version: '1.3.2',
+    version: '1.3.3',
 });
 
 const PYTHON_SCRIPT = path.join(__dirname, 'rh_wrapper.py');
@@ -585,7 +585,7 @@ process.on('SIGHUP', () => shutdown('SIGHUP'));
 // (the MCP client) disconnecting does NOT send a signal — it just closes
 // stdin. Without this handler the node process becomes a zombie inside the
 // container, accumulating one per reconnection until OOM. (See git log for
-// context on the v1.3.0 → v1.3.1 → v1.3.2 leak fixes.)
+// context on the v1.3.0 → v1.3.1 → v1.3.3 leak fixes.)
 process.stdin.on('end', () => shutdown('stdin-end'));
 process.stdin.on('close', () => shutdown('stdin-close'));
 process.stdin.on('error', (err) => {
@@ -610,7 +610,7 @@ async function main() {
     await server.connect(transport);
     resetIdleTimer(); // arm the abandoned-connection watchdog
     const idleMin = IDLE_TIMEOUT_MS > 0 ? `${Math.round(IDLE_TIMEOUT_MS / 60000)}min idle-timeout` : 'idle-timeout disabled';
-    console.error(`Robinhood MCP Server v1.3.2 running on stdio (${idleMin})`);
+    console.error(`Robinhood MCP Server v1.3.3 running on stdio (${idleMin})`);
 }
 
 main().catch((error) => {

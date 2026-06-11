@@ -888,19 +888,40 @@ def handle_command(data):
     else:
         raise ValueError(f"Unknown command: {command}")
 
+# Stash the REAL stdout at module load time. Several robin_stocks paths
+# (pickle loading, login verification, options pagination, etc.) print
+# diagnostics to whatever sys.stdout currently is. We swap sys.stdout to
+# an in-memory buffer while running their code and emit to this stash
+# directly so error/status text never corrupts our JSON-RPC stream.
+_REAL_STDOUT = sys.stdout
+
+
 def _emit(payload):
-    """Write a single JSON response line to stdout, exiting cleanly on broken pipe."""
+    """Write a single JSON response line to the REAL stdout (bypassing any
+    swapped-in suppression buffer)."""
     try:
-        sys.stdout.write(json.dumps(payload) + "\n")
-        sys.stdout.flush()
+        _REAL_STDOUT.write(json.dumps(payload) + "\n")
+        _REAL_STDOUT.flush()
     except BrokenPipeError:
         # Parent (Node MCP) has gone away. Stop quietly.
         _close_session()
         os._exit(0)
 
 
+def _handle_command_quiet(request):
+    """Run handle_command with stdout fully captured so library noise
+    (robin_stocks pickle-load errors, login prints, etc.) cannot leak
+    into the JSON-RPC stream. _emit always writes to _REAL_STDOUT."""
+    with _suppress_stdout():
+        return handle_command(request)
+
+
 def main():
-    maybe_login(reason="startup")
+    # Same suppression for the startup login — pickle-load errors print
+    # to stdout from inside robin_stocks before our login() wrapper even
+    # gets a chance.
+    with _suppress_stdout():
+        maybe_login(reason="startup")
 
     try:
         for line in sys.stdin:
@@ -916,7 +937,7 @@ def main():
                 continue
 
             try:
-                response_data = handle_command(request)
+                response_data = _handle_command_quiet(request)
                 _emit({"id": request_id, "status": "success", "data": response_data})
                 continue
             except Exception as e:
@@ -930,12 +951,13 @@ def main():
             # is set). If maybe_login returns a cached result, retrying would
             # hit the same 401, so fail fast instead.
             if "401" in error_str:
-                ok, msg, cached = maybe_login(
-                    reason="401-recovery", force_credentials=True
-                )
+                with _suppress_stdout():
+                    ok, msg, cached = maybe_login(
+                        reason="401-recovery", force_credentials=True
+                    )
                 if ok and not cached:
                     try:
-                        response_data = handle_command(request)
+                        response_data = _handle_command_quiet(request)
                         _emit({"id": request_id, "status": "success", "data": response_data})
                         continue
                     except Exception as retry_err:

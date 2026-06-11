@@ -13,3 +13,6 @@ scripts/js_bundles/
 scripts/probe_output.log
 __pycache__/
 *.pyc
+.env.bak
+.env.bak*
+.env.*

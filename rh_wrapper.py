@@ -9,6 +9,7 @@ import uuid
 import re
 import datetime
 import pyotp
+import requests
 import websocket
 from dotenv import load_dotenv
 
@@ -19,17 +20,50 @@ load_dotenv()
 # login() call for every command that arrives during the recovery window
 # — each one hitting Robinhood's auth endpoint and (if the user is on
 # credential + device-approval flow) spamming their phone with multiple
-# approval notifications.
+# approval notifications. Worse: the wrapper is respawned on every new
+# MCP connection and on every idle-timeout cycle (see index.js), and this
+# state used to live only in process memory — so each respawn forgot the
+# cooldown and fired another live login attempt. That repeated hammering
+# is almost certainly what got the account/IP rate-limited by Robinhood.
 #
-# _LOGIN_COOLDOWN_SEC is the minimum gap between two login attempts.
-# _LOGIN_FAIL_COOLDOWN_SEC kicks in if the previous login failed, so we
-# fail fast on subsequent commands instead of retrying every few ms.
-_LOGIN_COOLDOWN_SEC = 15.0
-_LOGIN_FAIL_COOLDOWN_SEC = 30.0
+# _LOGIN_MIN_GAP_SEC is a hard floor between any two login attempts —
+# success or failure, startup or 401-recovery — persisted to disk (same
+# volume the auth token lives in) so the floor survives process respawns
+# and container restarts, not just one process's lifetime.
+_LOGIN_MIN_GAP_SEC = float(os.getenv("ROBINHOOD_LOGIN_MIN_GAP_SEC", "1800"))
+_LOGIN_STATE_FILE = "/root/.tokens/login_state.json"
 
 _last_login_ts = 0.0
 _last_login_success = False
 _last_login_msg = "not attempted"
+
+
+def _load_login_state():
+    """Sync in-memory cooldown state from disk so a freshly spawned
+    process learns about attempts made by a prior process instead of
+    starting the cooldown clock at 0."""
+    global _last_login_ts, _last_login_success, _last_login_msg
+    try:
+        with open(_LOGIN_STATE_FILE) as f:
+            state = json.load(f)
+        _last_login_ts = float(state.get("ts", 0.0))
+        _last_login_success = bool(state.get("success", False))
+        _last_login_msg = str(state.get("msg", "not attempted"))
+    except (FileNotFoundError, ValueError, OSError):
+        pass
+
+
+def _save_login_state():
+    try:
+        tmp = _LOGIN_STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(
+                {"ts": _last_login_ts, "success": _last_login_success, "msg": _last_login_msg},
+                f,
+            )
+        os.replace(tmp, _LOGIN_STATE_FILE)
+    except OSError:
+        pass
 
 
 def _close_session():
@@ -56,52 +90,287 @@ for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         pass
 
 
-def login(force_credentials=False):
-    """Authenticate with Robinhood.
+# ── Session store + refresh-token renewal ────────────────────────────
+# Robinhood dropped TOTP support, so the credentials path now always needs
+# a device-approval tap. Access tokens last days, not forever — without
+# renewal the server silently died every few weeks. The OAuth token
+# response also carries a refresh_token; exchanging it for a new access
+# token needs no password and no phone push. We persist the latest pair
+# (Robinhood rotates the refresh token on every use) to the tokens volume.
+_SESSION_FILE = "/root/.tokens/session.json"
+_PICKLE_FILE = "/root/.tokens/robinhood.pickle"
+_TOKEN_URL = "https://api.robinhood.com/oauth2/token/"
+_CLIENT_ID = "c82SH0WZOsabOXGP2sxqcj34FxkvfnWRZBKlBjFS"  # same as robin_stocks / web app
+_REFRESH_EXPIRES_IN = int(os.getenv("ROBINHOOD_REFRESH_EXPIRES_IN", "734000"))
+# Renew proactively when the access token has less than this left.
+_REFRESH_AHEAD_SEC = float(os.getenv("ROBINHOOD_REFRESH_AHEAD_SEC", "1800"))
+# Floor between refresh attempts so a broken refresh can't hammer /oauth2/.
+_REFRESH_MIN_GAP_SEC = 60.0
+_last_refresh_ts = 0.0
 
-    On startup we honour `ROBINHOOD_ACCESS_TOKEN` from env when set — this
-    skips the device-approval push and is fast.
 
-    On a 401 / JWT-expired recovery path the caller passes
-    `force_credentials=True`. We then bypass the env token (which we now
-    know is invalid) and run the full user/password flow. If
-    `ROBINHOOD_MFA_SECRET` is set we generate a TOTP automatically;
-    otherwise robin_stocks triggers Robinhood's device-approval push
-    notification to the user's mobile app — the user taps "approve" and a
-    fresh token is issued + persisted to /root/.tokens/robinhood.pickle.
+def _strip_bearer(token):
+    token = (token or "").strip()
+    return token[7:].strip() if token.startswith("Bearer ") else token
+
+
+def _token_problem(token):
+    """Return why a token string is unusable, or None if it looks sane.
+    Catches the common copy-paste failure: DevTools elides long header
+    values with '…', and pasting that yields a non-ASCII, invalid token."""
+    if not token:
+        return "empty"
+    if not token.isascii():
+        return "contains non-ASCII characters (truncated copy from DevTools?)"
+    if any(c.isspace() for c in token):
+        return "contains whitespace"
+    return None
+
+
+def _jwt_exp(token):
+    """Expiry (unix seconds) from a JWT's payload, or None if not a JWT."""
+    try:
+        import base64
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return float(json.loads(base64.urlsafe_b64decode(payload))["exp"])
+    except Exception:
+        return None
+
+
+def _token_fp(token):
+    import hashlib
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+
+def _load_session():
+    try:
+        with open(_SESSION_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+def _save_session(data):
+    try:
+        tmp = _SESSION_FILE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, _SESSION_FILE)
+    except OSError as e:
+        sys.stderr.write(f"⚠️  could not persist session: {e}\n")
+        sys.stderr.flush()
+
+
+def _load_pickle_tokens():
+    """Tokens robin_stocks itself stored after a credentials login."""
+    try:
+        import pickle
+        with open(_PICKLE_FILE, "rb") as f:
+            data = pickle.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _store_tokens(access_token, refresh_token=None, device_token=None, source=""):
+    sess = _load_session()
+    sess["access_token"] = _strip_bearer(access_token)
+    if refresh_token:
+        sess["refresh_token"] = refresh_token
+    if device_token:
+        sess["device_token"] = device_token
+    sess["access_exp"] = _jwt_exp(sess["access_token"])
+    sess["saved_at"] = time.time()
+    sess["source"] = source
+    _save_session(sess)
+
+
+def _set_auth_header(token):
+    r.helper.SESSION.headers["Authorization"] = "Bearer " + _strip_bearer(token)
+    r.helper.set_login_state(True)
+
+
+def _clear_auth_header():
+    r.helper.SESSION.headers.pop("Authorization", None)
+    r.helper.set_login_state(False)
+
+
+def _refresh_candidates():
+    """Refresh tokens to try, best first, skipping ones already rejected or
+    already consumed (rotated away)."""
+    sess = _load_session()
+    dead = set(sess.get("dead_refresh_fps", []))
+    out = []
+    for src, tok in (
+        ("session", sess.get("refresh_token")),
+        ("env", os.getenv("ROBINHOOD_REFRESH_TOKEN")),
+        ("pickle", _load_pickle_tokens().get("refresh_token")),
+    ):
+        tok = (tok or "").strip()
+        if tok and _token_fp(tok) not in dead and tok not in [t for _, t in out]:
+            out.append((src, tok))
+    return out
+
+
+def _mark_refresh_dead(token):
+    sess = _load_session()
+    dead = sess.get("dead_refresh_fps", [])
+    fp = _token_fp(token)
+    if fp not in dead:
+        dead = (dead + [fp])[-20:]
+    sess["dead_refresh_fps"] = dead
+    if sess.get("refresh_token") == token:
+        sess.pop("refresh_token", None)
+    _save_session(sess)
+
+
+def _try_refresh(reason="manual"):
+    """Exchange a stored refresh token for a fresh access token.
+    No password, no device-approval push. Returns (ok, msg)."""
+    global _last_refresh_ts
+    candidates = _refresh_candidates()
+    if not candidates:
+        return False, "No refresh token available"
+    if time.time() - _last_refresh_ts < _REFRESH_MIN_GAP_SEC:
+        return False, "Refresh attempted too recently"
+    _last_refresh_ts = time.time()
+
+    sess = _load_session()
+    device_token = sess.get("device_token") or _load_pickle_tokens().get("device_token")
+    last_err = "no candidates tried"
+    for src, refresh_token in candidates:
+        payload = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": "internal",
+            "client_id": _CLIENT_ID,
+            "expires_in": _REFRESH_EXPIRES_IN,
+        }
+        if device_token:
+            payload["device_token"] = device_token
+        try:
+            # Don't send a (possibly dead) Bearer on the token endpoint.
+            hdrs = {"Origin": "https://robinhood.com", "Authorization": None}
+            resp = r.helper.SESSION.post(_TOKEN_URL, data=payload, headers=hdrs, timeout=15)
+        except Exception as e:
+            last_err = f"refresh request failed: {e}"
+            continue  # network problem — token isn't known-bad, keep it
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {}
+        if resp.ok and body.get("access_token"):
+            new_refresh = body.get("refresh_token") or refresh_token
+            if new_refresh != refresh_token:
+                _mark_refresh_dead(refresh_token)  # rotated; old one is spent
+            _store_tokens(body["access_token"], new_refresh, device_token, source=f"refresh:{src}")
+            _set_auth_header(body["access_token"])
+            exp = _jwt_exp(body["access_token"])
+            left = f", valid {((exp - time.time()) / 3600):.1f}h" if exp else ""
+            sys.stderr.write(f"🔄 Token refreshed via {src} refresh_token (reason={reason}{left})\n")
+            sys.stderr.flush()
+            return True, f"Refreshed access token ({src} refresh_token)"
+        last_err = f"refresh via {src} rejected: HTTP {resp.status_code} {str(body or resp.text)[:200]}"
+        if resp.status_code in (400, 401, 403):
+            _mark_refresh_dead(refresh_token)
+    sys.stderr.write(f"⚠️  {last_err}\n")
+    sys.stderr.flush()
+    return False, last_err
+
+
+def _access_candidates():
+    """(source, token, exp) for each sane access token, latest expiry first."""
+    sess = _load_session()
+    out = []
+    for src, tok in (
+        ("session", sess.get("access_token")),
+        ("env", os.getenv("ROBINHOOD_ACCESS_TOKEN")),
+    ):
+        tok = _strip_bearer(tok)
+        if not tok:
+            continue
+        problem = _token_problem(tok)
+        if problem:
+            sys.stderr.write(f"⚠️  Ignoring {src} access token: {problem}\n")
+            sys.stderr.flush()
+            continue
+        out.append((src, tok, _jwt_exp(tok)))
+    # Unknown expiry sorts after any known one but is still tried.
+    out.sort(key=lambda c: c[2] if c[2] is not None else 0, reverse=True)
+    return out
+
+
+def _try_access_token():
+    """Pick the freshest stored access token and validate it with a single
+    lightweight GET.
+
+    This is deliberately NOT gated by the login cooldown: it's a token
+    check, not a login attempt, and isn't the operation that risks
+    tripping Robinhood's abuse detection. Gating it would mean a freshly
+    supplied valid token couldn't be used until an unrelated cooldown from
+    a previous credentials failure expired. Returns (ok, msg); ok=False
+    means "no usable token, fall through to refresh / credentials".
     """
-    access_token = os.getenv("ROBINHOOD_ACCESS_TOKEN")
-    if not force_credentials and access_token and access_token.strip():
-        if not access_token.startswith("Bearer "):
-            access_token = "Bearer " + access_token
-        r.helper.SESSION.headers["Authorization"] = access_token
-        r.helper.set_login_state(True)
-        # Validate the token now — if it's dead, fall through to user/pass
-        # below instead of silently returning "success" and forcing the next
-        # API call to trigger 401 recovery. Saves one wasted request per
-        # startup and surfaces the failure mode early.
+    candidates = _access_candidates()
+    if not candidates:
+        return False, "No usable access token (session or ROBINHOOD_ACCESS_TOKEN)"
+
+    now = time.time()
+    for src, token, exp in candidates:
+        if exp is not None and exp <= now:
+            sys.stderr.write(f"⚠️  {src} access token expired {((now - exp) / 3600):.1f}h ago\n")
+            sys.stderr.flush()
+            continue
+        _set_auth_header(token)
         try:
             v = r.helper.SESSION.get(
                 "https://api.robinhood.com/user/", timeout=8,
                 headers={"Origin": "https://robinhood.com"},
             )
-            if v.status_code == 401:
-                sys.stderr.write(
-                    "⚠️  ROBINHOOD_ACCESS_TOKEN is expired/invalid (401). "
-                    "Falling back to user/password login.\n"
-                )
-                sys.stderr.flush()
-                r.helper.SESSION.headers.pop("Authorization", None)
-                r.helper.set_login_state(False)
-                # fall through to credentials flow below
-            else:
-                return True, "Logged in with Access Token"
-        except Exception as e:
-            # Network blip — assume token is OK and proceed.
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            # Genuine network blip — assume token is OK and proceed.
             sys.stderr.write(f"  (token validation skipped: {e})\n")
             sys.stderr.flush()
-            return True, "Logged in with Access Token (unvalidated)"
+            return True, f"Logged in with {src} access token (unvalidated)"
+        if v.status_code == 401:
+            sys.stderr.write(f"⚠️  {src} access token rejected (401)\n")
+            sys.stderr.flush()
+            _clear_auth_header()
+            continue
+        if src == "env":
+            # Adopt a newly pasted env token into the session store so its
+            # expiry is tracked alongside the refresh token.
+            _store_tokens(token, source="env")
+        return True, f"Logged in with {src} access token"
+    _clear_auth_header()
+    return False, "All access tokens expired/invalid"
 
+
+def _access_seconds_left():
+    exp = _jwt_exp(_strip_bearer(r.helper.SESSION.headers.get("Authorization", "")))
+    return None if exp is None else exp - time.time()
+
+
+def _refresh_if_expiring(reason):
+    """Renew ahead of expiry. A failed refresh leaves the current (still
+    valid) Authorization header untouched."""
+    left = _access_seconds_left()
+    if left is not None and left < _REFRESH_AHEAD_SEC:
+        _try_refresh(reason=f"{reason}-ahead")
+
+
+def _try_credentials_login():
+    """Full username/password (+ optional TOTP) login via robin_stocks.
+
+    This is the EXPENSIVE, risky path — a real auth POST to Robinhood that,
+    without ROBINHOOD_MFA_SECRET, triggers a device-approval push to the
+    mobile app. This is the path `_LOGIN_MIN_GAP_SEC` exists to protect; a
+    fresh token is issued + persisted to /root/.tokens/robinhood.pickle on
+    success.
+    """
     user = os.getenv("ROBINHOOD_USER")
     password = os.getenv("ROBINHOOD_PASSWORD")
     mfa_secret = os.getenv("ROBINHOOD_MFA_SECRET")
@@ -109,20 +378,19 @@ def login(force_credentials=False):
     if not user or not password:
         return False, "Missing credentials"
 
-    if force_credentials:
-        # Wipe the dead Authorization header so robin_stocks doesn't reuse
-        # the expired Bearer when its login() fires off internal API calls.
-        try:
-            r.helper.SESSION.headers.pop("Authorization", None)
-            r.helper.set_login_state(False)
-        except Exception:
-            pass
-        sys.stderr.write(
-            "🔔 Triggering fresh user/password login — if MFA_SECRET is "
-            "unset, Robinhood will push a device-approval notification "
-            "to the mobile app. Approve it to complete login.\n"
-        )
-        sys.stderr.flush()
+    # Wipe any dead Authorization header so robin_stocks doesn't reuse an
+    # expired Bearer when its login() fires off internal API calls.
+    try:
+        r.helper.SESSION.headers.pop("Authorization", None)
+        r.helper.set_login_state(False)
+    except Exception:
+        pass
+    sys.stderr.write(
+        "🔔 Triggering fresh user/password login — if MFA_SECRET is "
+        "unset, Robinhood will push a device-approval notification "
+        "to the mobile app. Approve it to complete login.\n"
+    )
+    sys.stderr.flush()
 
     try:
         # robin_stocks's login() prints status/errors to stdout which would
@@ -161,53 +429,98 @@ def login(force_credentials=False):
             tail = captured_text.strip().split("\n")[-5:]
             diag = " | ".join(line.strip() for line in tail if line.strip())
             return False, f"r.login silent failure: {diag}" if diag else "r.login silent failure (no diagnostic)"
+        # Keep the refresh token so the next expiry renews silently instead
+        # of needing another device approval.
+        _store_tokens(
+            login_result["access_token"],
+            login_result.get("refresh_token"),
+            _load_pickle_tokens().get("device_token"),
+            source="credentials",
+        )
         return True, "Logged in"
     except Exception as e:
         return False, str(e)
 
 
+def login(force_credentials=False):
+    """Authenticate with Robinhood.
+
+    Tries the cheap `ROBINHOOD_ACCESS_TOKEN` fast path first (unless
+    `force_credentials=True`, e.g. the 401-recovery path where we already
+    know the token is dead) and falls back to the full user/password flow
+    otherwise.
+    """
+    if not force_credentials:
+        ok, msg = _try_access_token()
+        if ok:
+            return True, msg
+    ok, msg = _try_refresh(reason="login")
+    if ok:
+        return True, msg
+    return _try_credentials_login()
+
+
 def maybe_login(reason="manual", force_credentials=False):
-    """Rate-limited wrapper around login().
+    """Rate-limited wrapper around the EXPENSIVE credentials login path.
 
-    If we attempted a login recently we memoize the prior result instead of
-    hitting the network again. Returns (ok, msg, was_cached).
+    The cheap `ROBINHOOD_ACCESS_TOKEN` validation (a single GET, not a
+    login POST) always runs first via `_try_access_token()` and is never
+    gated — see that function's docstring for why. Only the full
+    username/password fallback is gated.
 
-    `force_credentials=True` (used by 401-recovery path) bypasses the env
-    `ROBINHOOD_ACCESS_TOKEN` and runs the full user/password flow, which
-    triggers Robinhood's device-approval push to the mobile app.
+    `_LOGIN_MIN_GAP_SEC` is a hard floor between any two *credentials*
+    login attempts — success or failure, any `reason` — persisted to disk
+    so it holds across process respawns, not just one process's lifetime.
+    Returns (ok, msg, was_cached).
+
+    `force_credentials=True` (used by the 401-recovery path) skips the
+    token fast path entirely (we already know it's dead). Before the
+    gated credentials flow, a refresh-token renewal is tried — it needs
+    no password or phone approval, so it's the normal way an expired
+    session recovers. Only if that fails does the credentials flow run,
+    once the gap has elapsed — it does NOT bypass the gap itself. If
+    MFA_SECRET is unset this triggers Robinhood's device-approval push to
+    the mobile app; if that approval never happens, the resulting failure
+    still respects the same floor before the next attempt (and the next push).
     """
     global _last_login_ts, _last_login_success, _last_login_msg
+
+    if not force_credentials:
+        token_ok, token_msg = _try_access_token()
+        if token_ok:
+            sys.stderr.write(f"✅ Login ok (token fast-path, reason={reason}): {token_msg}\n")
+            sys.stderr.flush()
+            _refresh_if_expiring(reason)
+            return True, token_msg, False
+
+    refresh_ok, refresh_msg = _try_refresh(reason=reason)
+    if refresh_ok:
+        return True, refresh_msg, False
+
+    _load_login_state()
 
     now = time.time()
     elapsed = now - _last_login_ts
 
-    # Cooldown applies to BEST-EFFORT logins. When the caller explicitly
-    # asks for force_credentials (i.e., the previous "success" was env-token
-    # which we now know is invalid because the API just returned 401), we
-    # bypass the cache and force a fresh credential login. Otherwise we'd
-    # echo the stale cached success and the bot would hit the same 401.
-    if _last_login_ts > 0 and not force_credentials:
-        # Longer cooldown after a failed attempt — no point hammering auth.
-        cooldown = _LOGIN_COOLDOWN_SEC if _last_login_success else _LOGIN_FAIL_COOLDOWN_SEC
-        if elapsed < cooldown:
-            sys.stderr.write(
-                f"🔁 Login skipped (reason={reason}, cached {_last_login_msg!r}, "
-                f"{elapsed:.1f}s ago, cooldown={cooldown:.0f}s)\n"
-            )
-            sys.stderr.flush()
-            return _last_login_success, _last_login_msg, True
+    if _last_login_ts > 0 and elapsed < _LOGIN_MIN_GAP_SEC:
+        sys.stderr.write(
+            f"🔁 Credentials login skipped (reason={reason}, cached {_last_login_msg!r}, "
+            f"{elapsed:.1f}s ago, min_gap={_LOGIN_MIN_GAP_SEC:.0f}s)\n"
+        )
+        sys.stderr.flush()
+        return _last_login_success, _last_login_msg, True
 
     sys.stderr.write(
-        f"🔑 Login attempt (reason={reason}, force_credentials={force_credentials}) "
-        f"at t={now:.1f}\n"
+        f"🔑 Credentials login attempt (reason={reason}) at t={now:.1f}\n"
     )
     sys.stderr.flush()
 
-    ok, msg = login(force_credentials=force_credentials)
+    ok, msg = _try_credentials_login()
 
     _last_login_ts = time.time()
     _last_login_success = ok
     _last_login_msg = msg
+    _save_login_state()
 
     if ok:
         sys.stderr.write(f"✅ Login ok: {msg}\n")
@@ -936,6 +1249,11 @@ def main():
                 _emit({"id": None, "status": "error", "error": f"Invalid JSON request: {parse_err}"})
                 continue
 
+            # The process lives for days; renew before the token lapses
+            # mid-session rather than waiting for a 401.
+            with _suppress_stdout():
+                _refresh_if_expiring("command")
+
             try:
                 response_data = _handle_command_quiet(request)
                 _emit({"id": request_id, "status": "success", "data": response_data})
@@ -944,12 +1262,12 @@ def main():
                 error_str = str(e)
 
             # Auto re-login on any 401 (Unauthorized, JWT verification failed,
-            # token expired, etc.) and retry once. Force a fresh user/password
-            # login so the env-supplied ROBINHOOD_ACCESS_TOKEN — which we now
-            # know is invalid — is bypassed. This triggers Robinhood's device-
-            # approval push to the mobile app (or auto-completes if MFA secret
-            # is set). If maybe_login returns a cached result, retrying would
-            # hit the same 401, so fail fast instead.
+            # token expired, etc.) and retry once. The access token we hold is
+            # known-dead, so skip it: maybe_login tries a silent refresh-token
+            # renewal first, and only if that fails falls back to user/password
+            # (which triggers Robinhood's device-approval push). If maybe_login
+            # returns a cached result, retrying would hit the same 401, so fail
+            # fast instead.
             if "401" in error_str:
                 with _suppress_stdout():
                     ok, msg, cached = maybe_login(

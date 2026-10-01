@@ -27,6 +27,15 @@ This Node.js application serves as an MCP (Model Context Protocol) Server wrappe
 
 # Note: Replace the environment variable values in the docker-compose.yml
 
+### Authentication
+Login is tried in this order, cheapest first:
+
+1. **Access token**: the freshest of the stored session (`/root/.tokens/session.json`) and `ROBINHOOD_ACCESS_TOKEN`.
+2. **Refresh token**: silent renewal with no password and no phone approval. Sources are the stored session, `ROBINHOOD_REFRESH_TOKEN`, and the robin_stocks pickle. It also runs on a 401 and when the token has less than 30 min left. Robinhood rotates the refresh token on every use, and the newest one is saved automatically.
+3. **Username/password**: sends a device-approval push to the Robinhood app and is rate-limited by `ROBINHOOD_LOGIN_MIN_GAP_SEC`. Its refresh token is saved, so you only approve once.
+
+Copy tokens with a "copy value" action, not from the DevTools header view. That view truncates long values with `…`, which the wrapper now rejects.
+
 ## References
 - MCP Protocol and Server concepts
 - Integration with Perplexity and other LLM APIs

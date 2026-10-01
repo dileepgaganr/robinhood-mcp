@@ -211,6 +211,7 @@ def _refresh_candidates():
     already consumed (rotated away)."""
     sess = _load_session()
     dead = set(sess.get("dead_refresh_fps", []))
+    device = _device_token()
     out = []
     for src, tok in (
         ("session", sess.get("refresh_token")),
@@ -218,21 +219,38 @@ def _refresh_candidates():
         ("robin_stocks", _load_lib_tokens().get("refresh_token")),
     ):
         tok = (tok or "").strip()
-        if tok and _token_fp(tok) not in dead and tok not in [t for _, t in out]:
+        if tok and _dead_fp(tok, device) not in dead and tok not in [t for _, t in out]:
             out.append((src, tok))
     return out
+
+
+def _dead_fp(refresh_token, device_token):
+    # Keyed on the device too: a refresh rejected for a missing/wrong device
+    # ID gets another chance once ROBINHOOD_DEVICE_TOKEN is supplied.
+    return _token_fp(f"{refresh_token}|{device_token or ''}")
 
 
 def _mark_refresh_dead(token):
     sess = _load_session()
     dead = sess.get("dead_refresh_fps", [])
-    fp = _token_fp(token)
+    fp = _dead_fp(token, _device_token())
     if fp not in dead:
         dead = (dead + [fp])[-20:]
     sess["dead_refresh_fps"] = dead
     if sess.get("refresh_token") == token:
         sess.pop("refresh_token", None)
     _save_session(sess)
+
+
+def _device_token():
+    """Device ID the refresh token is bound to. A browser-issued refresh
+    token only renews with the browser's own device ID (robinhood.com's
+    `device_id` cookie); sending none or a different one gets invalid_grant."""
+    return (
+        os.getenv("ROBINHOOD_DEVICE_TOKEN", "").strip()
+        or _load_session().get("device_token")
+        or _load_lib_tokens().get("device_token")
+    )
 
 
 def _try_refresh(reason="manual"):
@@ -247,7 +265,7 @@ def _try_refresh(reason="manual"):
     _last_refresh_ts = time.time()
 
     sess = _load_session()
-    device_token = sess.get("device_token") or _load_lib_tokens().get("device_token")
+    device_token = _device_token()
     last_err = "no candidates tried"
     for src, refresh_token in candidates:
         payload = {
@@ -306,8 +324,12 @@ def _access_candidates():
             sys.stderr.flush()
             continue
         out.append((src, tok, _jwt_exp(tok)))
-    # Unknown expiry sorts after any known one but is still tried.
-    out.sort(key=lambda c: c[2] if c[2] is not None else 0, reverse=True)
+    # Once a refresh chain exists, its session token wins even over a
+    # longer-lived env token: using it means the chain renews every few
+    # days and never sits idle long enough to lapse. Otherwise freshest
+    # expiry first; unknown expiry sorts last but is still tried.
+    chain = bool(sess.get("refresh_token"))
+    out.sort(key=lambda c: (chain and c[0] == "session", c[2] if c[2] is not None else 0), reverse=True)
     return out
 
 

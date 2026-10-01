@@ -98,7 +98,8 @@ for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
 # token needs no password and no phone push. We persist the latest pair
 # (Robinhood rotates the refresh token on every use) to the tokens volume.
 _SESSION_FILE = "/root/.tokens/session.json"
-_PICKLE_FILE = "/root/.tokens/robinhood.pickle"
+# robin_stocks 3.4.0 stores its session as a pickle; robin_stocks_v2 as JSON.
+_LIB_SESSION_FILES = ("/root/.tokens/robinhood.json", "/root/.tokens/robinhood.pickle")
 _TOKEN_URL = "https://api.robinhood.com/oauth2/token/"
 _CLIENT_ID = "c82SH0WZOsabOXGP2sxqcj34FxkvfnWRZBKlBjFS"  # same as robin_stocks / web app
 _REFRESH_EXPIRES_IN = int(os.getenv("ROBINHOOD_REFRESH_EXPIRES_IN", "734000"))
@@ -164,15 +165,22 @@ def _save_session(data):
         sys.stderr.flush()
 
 
-def _load_pickle_tokens():
+def _load_lib_tokens():
     """Tokens robin_stocks itself stored after a credentials login."""
-    try:
-        import pickle
-        with open(_PICKLE_FILE, "rb") as f:
-            data = pickle.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    import pickle
+    for path in _LIB_SESSION_FILES:
+        try:
+            if path.endswith(".json"):
+                with open(path) as f:
+                    data = json.load(f)
+            else:
+                with open(path, "rb") as f:
+                    data = pickle.load(f)
+            if isinstance(data, dict) and data:
+                return data
+        except Exception:
+            continue
+    return {}
 
 
 def _store_tokens(access_token, refresh_token=None, device_token=None, source=""):
@@ -207,7 +215,7 @@ def _refresh_candidates():
     for src, tok in (
         ("session", sess.get("refresh_token")),
         ("env", os.getenv("ROBINHOOD_REFRESH_TOKEN")),
-        ("pickle", _load_pickle_tokens().get("refresh_token")),
+        ("robin_stocks", _load_lib_tokens().get("refresh_token")),
     ):
         tok = (tok or "").strip()
         if tok and _token_fp(tok) not in dead and tok not in [t for _, t in out]:
@@ -239,7 +247,7 @@ def _try_refresh(reason="manual"):
     _last_refresh_ts = time.time()
 
     sess = _load_session()
-    device_token = sess.get("device_token") or _load_pickle_tokens().get("device_token")
+    device_token = sess.get("device_token") or _load_lib_tokens().get("device_token")
     last_err = "no candidates tried"
     for src, refresh_token in candidates:
         payload = {
@@ -368,7 +376,7 @@ def _try_credentials_login():
     This is the EXPENSIVE, risky path — a real auth POST to Robinhood that,
     without ROBINHOOD_MFA_SECRET, triggers a device-approval push to the
     mobile app. This is the path `_LOGIN_MIN_GAP_SEC` exists to protect; a
-    fresh token is issued + persisted to /root/.tokens/robinhood.pickle on
+    fresh token is issued + persisted to /root/.tokens/ (robin_stocks session file) on
     success.
     """
     user = os.getenv("ROBINHOOD_USER")
@@ -399,6 +407,20 @@ def _try_credentials_login():
         old_stdout = sys.stdout
         captured = io.StringIO()
         sys.stdout = captured
+        # robin_stocks answers SMS/email challenges with input(), which here
+        # would read the next JSON-RPC request off stdin as the "code". Fail
+        # that challenge loudly instead of corrupting the command stream.
+        import builtins
+        old_input = builtins.input
+
+        def _no_input(prompt=""):
+            raise RuntimeError(
+                "Robinhood issued an SMS/email code challenge, which can't be "
+                "answered non-interactively. Log in once on robinhood.com, or "
+                "set ROBINHOOD_REFRESH_TOKEN."
+            )
+
+        builtins.input = _no_input
         try:
             if mfa_secret and mfa_secret.strip():
                 totp = pyotp.TOTP(mfa_secret).now()
@@ -407,9 +429,10 @@ def _try_credentials_login():
                 login_result = r.login(user, password)
         finally:
             sys.stdout = old_stdout
+            builtins.input = old_input
         captured_text = captured.getvalue()
 
-        # Detect silent failure. robin_stocks 3.4.0's r.login() does NOT
+        # Detect silent failure. robin_stocks' r.login() does NOT
         # always raise on failure — e.g., a 429 from the device-approval
         # push endpoint just prints "Login failed. Check credentials..."
         # and returns None. So check the actual session state, not just
@@ -434,7 +457,7 @@ def _try_credentials_login():
         _store_tokens(
             login_result["access_token"],
             login_result.get("refresh_token"),
-            _load_pickle_tokens().get("device_token"),
+            _load_lib_tokens().get("device_token"),
             source="credentials",
         )
         return True, "Logged in"

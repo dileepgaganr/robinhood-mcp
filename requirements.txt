@@ -1,3 +1,5 @@
-robin_stocks
+# robin_stocks_v2: maintained fork of robin_stocks (same import name). Pinned to
+# a commit; its login fix credits device approval to the reused device token.
+robin_stocks @ https://github.com/DhruvaBansal00/robin_stocks_v2/archive/cd2f4f368fba60ae45d139095238a5aadb7a1daa.zip
 pyotp
 websocket-client

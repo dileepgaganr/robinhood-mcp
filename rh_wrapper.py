@@ -55,7 +55,7 @@ def _load_login_state():
 
 def _save_login_state():
     try:
-        tmp = _LOGIN_STATE_FILE + ".tmp"
+        tmp = _unique_tmp(_LOGIN_STATE_FILE)
         with open(tmp, "w") as f:
             json.dump(
                 {"ts": _last_login_ts, "success": _last_login_success, "msg": _last_login_msg},
@@ -64,6 +64,14 @@ def _save_login_state():
         os.replace(tmp, _LOGIN_STATE_FILE)
     except OSError:
         pass
+
+
+def _unique_tmp(path):
+    # Every MCP connection runs its own wrapper process, all writing the
+    # same files. A shared ".tmp" name let concurrent writers truncate each
+    # other's half-written file before os.replace — which wiped session.json
+    # (and the live refresh token with it) on 2026-10-29.
+    return f"{path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
 
 
 def _close_session():
@@ -108,6 +116,37 @@ _REFRESH_AHEAD_SEC = float(os.getenv("ROBINHOOD_REFRESH_AHEAD_SEC", "1800"))
 # Floor between refresh attempts so a broken refresh can't hammer /oauth2/.
 _REFRESH_MIN_GAP_SEC = 60.0
 _last_refresh_ts = 0.0
+_SESSION_LOCK_FILE = "/root/.tokens/session.lock"
+_lock_fd = None
+_lock_depth = 0
+
+
+class _session_lock:
+    """Cross-process exclusive lock around session read-modify-write and
+    refresh. Serializing refresh matters as much as the file: Robinhood
+    rotates the refresh token on use, so two processes refreshing with the
+    same token means the loser gets invalid_grant. Reentrant within a
+    process (flock on a second fd from the same process would deadlock)."""
+    def __enter__(self):
+        global _lock_fd, _lock_depth
+        if _lock_depth == 0:
+            import fcntl
+            try:
+                _lock_fd = os.open(_SESSION_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+                fcntl.flock(_lock_fd, fcntl.LOCK_EX)
+            except OSError:
+                _lock_fd = None  # no tokens volume (e.g. tests) — run unlocked
+        _lock_depth += 1
+        return self
+
+    def __exit__(self, *exc):
+        global _lock_fd, _lock_depth
+        _lock_depth -= 1
+        if _lock_depth == 0 and _lock_fd is not None:
+            import fcntl
+            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+            os.close(_lock_fd)
+            _lock_fd = None
 
 
 def _strip_bearer(token):
@@ -149,13 +188,17 @@ def _load_session():
         with open(_SESSION_FILE) as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, ValueError, OSError):
+    except ValueError:
+        sys.stderr.write(f"⚠️  {_SESSION_FILE} is corrupt — refresh chain unreadable\n")
+        sys.stderr.flush()
+        return {}
+    except (FileNotFoundError, OSError):
         return {}
 
 
 def _save_session(data):
     try:
-        tmp = _SESSION_FILE + ".tmp"
+        tmp = _unique_tmp(_SESSION_FILE)
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             json.dump(data, f)
@@ -184,6 +227,11 @@ def _load_lib_tokens():
 
 
 def _store_tokens(access_token, refresh_token=None, device_token=None, source=""):
+    with _session_lock():
+        _store_tokens_locked(access_token, refresh_token, device_token, source)
+
+
+def _store_tokens_locked(access_token, refresh_token, device_token, source):
     sess = _load_session()
     sess["access_token"] = _strip_bearer(access_token)
     if refresh_token:
@@ -231,6 +279,11 @@ def _dead_fp(refresh_token, device_token):
 
 
 def _mark_refresh_dead(token):
+    with _session_lock():
+        _mark_refresh_dead_locked(token)
+
+
+def _mark_refresh_dead_locked(token):
     sess = _load_session()
     dead = sess.get("dead_refresh_fps", [])
     fp = _dead_fp(token, _device_token())
@@ -257,14 +310,26 @@ def _try_refresh(reason="manual"):
     """Exchange a stored refresh token for a fresh access token.
     No password, no device-approval push. Returns (ok, msg)."""
     global _last_refresh_ts
+    if time.time() - _last_refresh_ts < _REFRESH_MIN_GAP_SEC:
+        return False, "Refresh attempted too recently"
+    with _session_lock():
+        # Another process may have refreshed while we waited for the lock;
+        # its fresh token is in the store, and our refresh token is spent.
+        sess = _load_session()
+        current = _strip_bearer(r.helper.SESSION.headers.get("Authorization", ""))
+        stored = sess.get("access_token")
+        if (stored and stored != current and sess.get("refresh_token")
+                and (sess.get("access_exp") or 0) - time.time() > _REFRESH_AHEAD_SEC):
+            _set_auth_header(stored)
+            return True, "Picked up token refreshed by another process"
+        _last_refresh_ts = time.time()
+        return _try_refresh_locked(reason)
+
+
+def _try_refresh_locked(reason):
     candidates = _refresh_candidates()
     if not candidates:
         return False, "No refresh token available"
-    if time.time() - _last_refresh_ts < _REFRESH_MIN_GAP_SEC:
-        return False, "Refresh attempted too recently"
-    _last_refresh_ts = time.time()
-
-    sess = _load_session()
     device_token = _device_token()
     last_err = "no candidates tried"
     for src, refresh_token in candidates:
@@ -348,11 +413,19 @@ def _try_access_token():
     if not candidates:
         return False, "No usable access token (session or ROBINHOOD_ACCESS_TOKEN)"
 
+    # With a refresh chain, a dead session token means "refresh now" — not
+    # "fall back to the env token". Falling back left the chain unused from
+    # Oct 7 until the env token expired on Oct 30, by which point it was gone.
+    chain = bool(_load_session().get("refresh_token"))
     now = time.time()
     for src, token, exp in candidates:
         if exp is not None and exp <= now:
             sys.stderr.write(f"⚠️  {src} access token expired {((now - exp) / 3600):.1f}h ago\n")
             sys.stderr.flush()
+            if src == "session" and chain:
+                ok, msg = _try_refresh(reason="session-expired")
+                if ok:
+                    return True, msg
             continue
         _set_auth_header(token)
         try:
@@ -368,11 +441,19 @@ def _try_access_token():
         if v.status_code == 401:
             sys.stderr.write(f"⚠️  {src} access token rejected (401)\n")
             sys.stderr.flush()
+            if src == "session" and chain:
+                # Header still holds the revoked token, so _try_refresh won't
+                # mistake it for one another process just refreshed.
+                ok, msg = _try_refresh(reason="session-401")
+                if ok:
+                    return True, msg
             _clear_auth_header()
             continue
-        if src == "env":
+        if src == "env" and not chain and _load_session().get("access_token") != token:
             # Adopt a newly pasted env token into the session store so its
-            # expiry is tracked alongside the refresh token.
+            # expiry is tracked. Never over a refresh chain (that would park
+            # the chain behind the env token), and only when it changed —
+            # rewriting on every process start is what raced.
             _store_tokens(token, source="env")
         return True, f"Logged in with {src} access token"
     _clear_auth_header()

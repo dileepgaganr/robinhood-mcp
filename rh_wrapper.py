@@ -473,6 +473,36 @@ def _refresh_if_expiring(reason):
         _try_refresh(reason=f"{reason}-ahead")
 
 
+_KEEP_WARM_EVERY_SEC = float(os.getenv("ROBINHOOD_KEEP_WARM_SEC", str(2 * 86400)))
+_KEEP_WARM_CHECK_SEC = 3600.0
+
+
+def keep_warm():
+    """Background loop: renew the stored chain every couple of days even when
+    no MCP client connects. A refresh token left unused past its lifetime
+    (~8.5 days) dies, and then only a fresh browser/device login recovers.
+    Checks hourly against wall-clock `saved_at` so host sleep doesn't
+    stretch the interval."""
+    sys.stderr.write(f"♨️  keep-warm started (every {_KEEP_WARM_EVERY_SEC / 3600:.0f}h)\n")
+    sys.stderr.flush()
+    while True:
+        try:
+            sess = _load_session()
+            age = time.time() - (sess.get("saved_at") or 0)
+            if sess.get("refresh_token") and age >= _KEEP_WARM_EVERY_SEC:
+                # Present the stored token as ours so _try_refresh renews it
+                # instead of "picking up" what looks like another process's.
+                if sess.get("access_token"):
+                    _set_auth_header(sess["access_token"])
+                ok, msg = _try_refresh(reason="keep-warm")
+                sys.stderr.write(f"♨️  keep-warm: {msg}\n")
+                sys.stderr.flush()
+        except Exception as e:
+            sys.stderr.write(f"⚠️  keep-warm error: {e}\n")
+            sys.stderr.flush()
+        time.sleep(_KEEP_WARM_CHECK_SEC)
+
+
 def _try_credentials_login():
     """Full username/password (+ optional TOTP) login via robin_stocks.
 
@@ -1420,4 +1450,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--keep-warm" in sys.argv:
+        keep_warm()
+    else:
+        main()

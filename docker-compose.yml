@@ -10,6 +10,9 @@ services:
     stdin_open: true # -i
     tty: false       # We want raw stdout/stdin for MCP, not a TTY
     restart: unless-stopped
+    # PID 1 stays inert (see Dockerfile); keep-warm runs beside it and is
+    # relaunched if it ever dies, so it can never restart the container.
+    command: ["sh", "-c", "(while :; do python3 rh_wrapper.py --keep-warm; sleep 60; done) & exec sleep infinity"]
     init: true       # PID 1 is a tiny reaper — cleans up orphaned node/python
                      # children left behind when `docker exec -i ... node index.js`
                      # wrappers die without signal propagation. Prevents the

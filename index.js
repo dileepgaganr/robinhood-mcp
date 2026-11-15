@@ -6,6 +6,7 @@ const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio
 const { z } = require('zod');
 const { spawn } = require('child_process');
 const path = require('path');
+const { cached } = require('./cache');
 
 const server = new McpServer({
     name: 'robinhood-mcp',
@@ -179,12 +180,74 @@ function runPythonCommand(command, args = []) {
     });
 }
 
+// ── Cache TTLs per command (ms). Commands absent here are never cached. ──
+// Shared via ~/.cache/mcp-servers/ so bots and scheduled runs reuse results.
+const TTL = {
+    // Live prices — short TTL to prevent throttling without serving stale data
+    quote:                   60_000,   // 1 min
+    option_quote:            30_000,   // 30 s
+    option_market_data:      30_000,
+    futures_quote:           30_000,
+    futures_trade:           30_000,
+    futures_l2_snapshot:     30_000,
+    // Option chains + movers — change every few minutes
+    option_find:             60_000,   // 1 min (has live prices)
+    movers:                 300_000,   // 5 min
+    news:                   900_000,   // 15 min
+    option_chain:         3_600_000,   // 1 h (strike/expiry metadata, no prices)
+    option_expirations:   3_600_000,
+    // Account snapshot. POSITION/QUANTITY state is ACTED ON by reconcile +
+    // ghost-flatten with MARKET orders — 5-min caching made the live bot
+    // "close" an already-closed short on 2026-08-10 (stale snapshot),
+    // opening a real unhedged long. Position truth gets 15s: long enough to
+    // dedupe a burst, never stale enough to trade against.
+    portfolio:              300_000,   // 5 min (informational)
+    positions:               15_000,
+    option_positions:        15_000,
+    futures_positions:       15_000,
+    futures_pnl:            300_000,
+    futures_buying_power:   300_000,
+    buying_power_breakdown: 300_000,
+    futures_contract_quantity: 15_000,
+    orders:                  30_000,
+    futures_orders:          30_000,
+    // Single-order status feeds fill-confirmation loops — caching it serves
+    // "pending" for minutes after the real fill (the duplicate-fill class).
+    // Never cache.
+    futures_order:                0,
+    futures_preview_order:   60_000,
+    // Historical data — the RESPONSE is a rolling now-anchored window whose
+    // newest bars (incl. the forming bar) change every poll, so it must NOT
+    // be cached long. The old 6h TTL froze the fleet's candle feed for hours
+    // at a time (Aug 3-9 2026: forex bots entered 3-6.5h-stale signals at
+    // live prices; see Finance-Bot research/forex_paper_dissection). 4 min
+    // still dedupes concurrent consumers (paper+live bots+Desktop poll every
+    // 300s) without serving stale bars.
+    historicals:            240_000,   // 4 min
+    crypto_historicals:     240_000,
+    futures_historicals:    240_000,
+    // Slow-changing reference data
+    futures_eligibility:  3_600_000,   // 1 h
+    futures_margin_requirement: 3_600_000,
+    futures_contract:     3_600_000,
+    watchlists:           1_800_000,   // 30 min
+    futures_expirations: 21_600_000,   // 6 h
+    // Very stable metadata — cache for a full day
+    instrument:          86_400_000,   // 24 h
+    fundamentals:        86_400_000,
+    earnings:            86_400_000,
+    futures_products:    86_400_000,
+    futures_product:     86_400_000,
+};
+
 // ── Helper to wrap tool handlers in compact-JSON + error formatting ──
 
 function makeHandler(command, label, mapArgs = () => []) {
     return async (input) => {
         try {
-            const data = await runPythonCommand(command, mapArgs(input));
+            const args = mapArgs(input);
+            const ttlMs = TTL[command] || 0;
+            const data = await cached(`rh-${command}`, args, ttlMs, () => runPythonCommand(command, args));
             return { content: [{ type: 'text', text: JSON.stringify(data) }] };
         } catch (error) {
             return {
